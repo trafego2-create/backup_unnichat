@@ -1,0 +1,4 @@
+requests
+supabase
+fastapi
+uvicorn[standard]
