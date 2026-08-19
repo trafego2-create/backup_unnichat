@@ -26,6 +26,11 @@ alter table unnichat_message_backups
 create index if not exists idx_unnichat_message_backups_phone
     on unnichat_message_backups (phone_number);
 
+-- Data de criação do contato na Unnichat (vem como texto, ex: "07/08/2026, 18:08:08" —
+-- guardado como texto pra não dar erro de parsing com formato nao-ISO).
+alter table unnichat_message_backups
+    add column if not exists contact_created_at text;
+
 -- View pro dashboard: uma linha por pessoa/curso já arquivado.
 create or replace view contact_backup_summary as
 select
@@ -33,6 +38,7 @@ select
     course,
     max(phone_number) as phone_number,
     max(contact_name) as contact_name,
+    max(contact_created_at) as contact_created_at,
     count(*) as message_count,
     count(*) filter (where storage_path is not null) as media_count,
     max(message_date) as last_message_date
