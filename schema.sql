@@ -32,15 +32,19 @@ alter table unnichat_message_backups
     add column if not exists contact_created_at text;
 
 -- View pro dashboard: uma linha por pessoa/curso já arquivado.
-create or replace view contact_backup_summary as
+-- (drop + create, pra evitar erro de "cannot change name of view column"
+-- quando a ordem das colunas muda em relação à versão anterior da view)
+drop view if exists contact_backup_summary;
+
+create view contact_backup_summary as
 select
     contact_id,
     course,
     max(phone_number) as phone_number,
     max(contact_name) as contact_name,
-    max(contact_created_at) as contact_created_at,
     count(*) as message_count,
     count(*) filter (where storage_path is not null) as media_count,
-    max(message_date) as last_message_date
+    max(message_date) as last_message_date,
+    max(contact_created_at) as contact_created_at
 from unnichat_message_backups
 group by contact_id, course;
