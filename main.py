@@ -40,7 +40,14 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
         raise HTTPException(status_code=400, detail="course inválido")
 
     body = await request.json()
-    contact_id = body.get("id") or body.get("contactId")
+    print(f"[{course}] payload recebido: {body}")
+
+    contact_id = (
+        body.get("id")
+        or body.get("contactId")
+        or (body.get("contact") or {}).get("id")
+        or (body.get("data") or {}).get("id")
+    )
     if not contact_id:
         raise HTTPException(status_code=400, detail="contactId ausente no body")
 
