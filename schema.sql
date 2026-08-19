@@ -17,3 +17,24 @@ alter table unnichat_message_backups
     alter column message_type set not null;
 
 -- Bucket "unnichat-audios" continua sendo usado pra qualquer mídia (áudio, vídeo, imagem, documento).
+
+-- Adiciona telefone/nome pra identificar a pessoa sem precisar do contact_id (UUID interno).
+alter table unnichat_message_backups
+    add column if not exists phone_number text,
+    add column if not exists contact_name text;
+
+create index if not exists idx_unnichat_message_backups_phone
+    on unnichat_message_backups (phone_number);
+
+-- View pro dashboard: uma linha por pessoa/curso já arquivado.
+create or replace view contact_backup_summary as
+select
+    contact_id,
+    course,
+    max(phone_number) as phone_number,
+    max(contact_name) as contact_name,
+    count(*) as message_count,
+    count(*) filter (where storage_path is not null) as media_count,
+    max(message_date) as last_message_date
+from unnichat_message_backups
+group by contact_id, course;
