@@ -1,16 +1,17 @@
 """
-Webhook de backup de áudios da Unnichat.
+Webhook de backup de conversas da Unnichat.
 
 Chamado pelo fluxo de automação de cada conexão (INSS/TJ/BB) quando um
 contato recebe a tag backup_supabase_{course}. Busca as mensagens do
-contato, filtra os áudios e arquiva no Supabase Storage + tabela
-unnichat_audio_backups.
+contato e arquiva tudo: texto direto na tabela, mídia (áudio/vídeo/
+imagem/documento) no Supabase Storage com o caminho salvo na tabela.
 
 Rota: POST /webhook/{course}   (course = inss | tj | bb)
 Header obrigatório: X-Webhook-Secret
-Body: o objeto do contato que a própria Unnichat manda (contém "id").
+Body: o objeto que a própria Unnichat manda (contém "contact.id" ou "id").
 """
 
+import mimetypes
 import os
 
 import requests
@@ -59,17 +60,16 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
     )
     resp.raise_for_status()
     messages = resp.json()["data"]
-    audio_messages = [m for m in messages if m.get("type") == "audio"]
 
-    results = [backup_audio_message(course, contact_id, msg) for msg in audio_messages]
+    results = [backup_message(course, contact_id, msg) for msg in messages]
     return {"success": True, "contactId": contact_id, "course": course, "processed": results}
 
 
-def backup_audio_message(course: str, contact_id: str, msg: dict) -> dict:
+def backup_message(course: str, contact_id: str, msg: dict) -> dict:
     message_id = msg["id"]
 
     existing = (
-        supabase.table("unnichat_audio_backups")
+        supabase.table("unnichat_message_backups")
         .select("message_id")
         .eq("message_id", message_id)
         .execute()
@@ -77,28 +77,34 @@ def backup_audio_message(course: str, contact_id: str, msg: dict) -> dict:
     if existing.data:
         return {"messageId": message_id, "status": "already_backed_up"}
 
-    audio_resp = requests.get(msg["url"], timeout=60)
-    audio_resp.raise_for_status()
-    audio_bytes = audio_resp.content
+    row = {
+        "message_id": message_id,
+        "contact_id": contact_id,
+        "course": course,
+        "message_type": msg.get("type", "unknown"),
+        "sender_by": msg.get("senderBy"),
+        "message_date": msg["date"],
+        "text_content": msg.get("message"),
+        "storage_path": None,
+        "original_url": None,
+    }
 
-    ext = msg["url"].split("?")[0].rsplit(".", 1)[-1]
-    storage_path = f"{course}/{contact_id}/{message_id}.{ext}"
+    if msg.get("url"):
+        media_resp = requests.get(msg["url"], timeout=60)
+        media_resp.raise_for_status()
 
-    supabase.storage.from_(SUPABASE_BUCKET).upload(
-        storage_path, audio_bytes, {"content-type": f"audio/{ext}"}
-    )
+        ext = msg["url"].split("?")[0].rsplit(".", 1)[-1]
+        content_type = mimetypes.guess_type(f"file.{ext}")[0] or "application/octet-stream"
+        storage_path = f"{course}/{contact_id}/{message_id}.{ext}"
 
-    supabase.table("unnichat_audio_backups").insert(
-        {
-            "message_id": message_id,
-            "contact_id": contact_id,
-            "course": course,
-            "sender_by": msg["senderBy"],
-            "message_date": msg["date"],
-            "storage_path": storage_path,
-            "original_url": msg["url"],
-        }
-    ).execute()
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            storage_path, media_resp.content, {"content-type": content_type}
+        )
+
+        row["storage_path"] = storage_path
+        row["original_url"] = msg["url"]
+
+    supabase.table("unnichat_message_backups").insert(row).execute()
 
     return {"messageId": message_id, "status": "backed_up"}
 

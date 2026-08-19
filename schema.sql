@@ -1,17 +1,19 @@
--- Rodar no SQL editor do Supabase antes de usar o script.
+-- Rodar no SQL editor do Supabase.
+-- Evolui a tabela de "só áudio" pra "toda mensagem" (texto inline, mídia no Storage).
 
-create table if not exists unnichat_audio_backups (
-    message_id text primary key,
-    contact_id text not null,
-    course text not null,          -- 'inss' | 'tj' | 'bb'
-    sender_by text not null,       -- 'user' (atendente) ou 'contact' (cliente)
-    message_date timestamptz not null,
-    storage_path text not null,
-    original_url text not null,
-    backed_up_at timestamptz not null default now()
-);
+alter table unnichat_audio_backups rename to unnichat_message_backups;
 
-create index if not exists idx_unnichat_audio_backups_contact
-    on unnichat_audio_backups (contact_id);
+alter table unnichat_message_backups
+    add column if not exists message_type text,
+    add column if not exists text_content text;
 
--- Criar o bucket "unnichat-audios" em Storage > New bucket (privado, sem acesso público).
+alter table unnichat_message_backups
+    alter column storage_path drop not null,
+    alter column original_url drop not null;
+
+update unnichat_message_backups set message_type = 'audio' where message_type is null;
+
+alter table unnichat_message_backups
+    alter column message_type set not null;
+
+-- Bucket "unnichat-audios" continua sendo usado pra qualquer mídia (áudio, vídeo, imagem, documento).
