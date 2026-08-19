@@ -64,12 +64,18 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
         raise HTTPException(status_code=400, detail="contactId ausente no body")
     phone_number = contact_obj.get("phoneNumber")
     contact_name = contact_obj.get("name")
-    contact_created_at = contact_obj.get("createdAt")
 
     token = UNNICHAT_TOKENS[course]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # O payload da automação não traz "createdAt" (só vem no GET /contact/{id}
+    # completo), então buscamos separado.
+    contact_resp = requests.get(f"{UNNICHAT_API_BASE}/contact/{contact_id}", headers=headers, timeout=30)
+    contact_created_at = contact_resp.json().get("data", {}).get("createdAt") if contact_resp.ok else None
+
     resp = requests.get(
         f"{UNNICHAT_API_BASE}/contact/{contact_id}/messages",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=headers,
         timeout=30,
     )
     resp.raise_for_status()
