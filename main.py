@@ -16,10 +16,11 @@ import io
 import mimetypes
 import os
 import secrets
+import threading
 import zipfile
 
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from supabase import create_client
@@ -40,6 +41,11 @@ supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVIC
 app = FastAPI()
 basic_auth = HTTPBasic()
 
+# Limita quantos contatos são processados (chamadas na API da Unnichat +
+# download/upload de mídia) ao mesmo tempo, pra aguentar picos de milhares
+# de tags aplicadas de uma vez sem estourar a API da Unnichat ou o Supabase.
+PROCESSING_SEMAPHORE = threading.Semaphore(3)
+
 
 def require_dashboard_auth(credentials: HTTPBasicCredentials = Depends(basic_auth)) -> None:
     if not secrets.compare_digest(credentials.password, DASHBOARD_PASSWORD):
@@ -47,14 +53,18 @@ def require_dashboard_auth(credentials: HTTPBasicCredentials = Depends(basic_aut
 
 
 @app.post("/webhook/{course}")
-async def webhook(course: str, request: Request, x_webhook_secret: str = Header(None)):
+async def webhook(
+    course: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_webhook_secret: str = Header(None),
+):
     if x_webhook_secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
     if course not in UNNICHAT_TOKENS:
         raise HTTPException(status_code=400, detail="course inválido")
 
     body = await request.json()
-    print(f"[{course}] payload recebido: {body}")
 
     # A Unnichat manda o contato solto no corpo, ou aninhado em "contact"/"data"
     # dependendo do gatilho da automação.
@@ -65,27 +75,40 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
     phone_number = contact_obj.get("phoneNumber")
     contact_name = contact_obj.get("name")
 
-    token = UNNICHAT_TOKENS[course]
-    headers = {"Authorization": f"Bearer {token}"}
+    # Responde na hora e processa em segundo plano: com picos de milhares de
+    # tags aplicadas de uma vez, a Unnichat marca como falha se demorarmos
+    # pra responder, mesmo que o backup em si funcione.
+    background_tasks.add_task(process_contact, course, contact_id, phone_number, contact_name)
+    return {"success": True, "queued": True, "contactId": contact_id, "course": course}
 
-    # O payload da automação não traz "createdAt" (só vem no GET /contact/{id}
-    # completo), então buscamos separado.
-    contact_resp = requests.get(f"{UNNICHAT_API_BASE}/contact/{contact_id}", headers=headers, timeout=30)
-    contact_created_at = contact_resp.json().get("data", {}).get("createdAt") if contact_resp.ok else None
 
-    resp = requests.get(
-        f"{UNNICHAT_API_BASE}/contact/{contact_id}/messages",
-        headers=headers,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    messages = resp.json()["data"]
+def process_contact(course: str, contact_id: str, phone_number: str, contact_name: str) -> None:
+    with PROCESSING_SEMAPHORE:
+        try:
+            token = UNNICHAT_TOKENS[course]
+            headers = {"Authorization": f"Bearer {token}"}
 
-    results = [
-        backup_message(course, contact_id, phone_number, contact_name, contact_created_at, msg)
-        for msg in messages
-    ]
-    return {"success": True, "contactId": contact_id, "course": course, "processed": results}
+            # O payload da automação não traz "createdAt" (só vem no GET
+            # /contact/{id} completo), então buscamos separado.
+            contact_resp = requests.get(f"{UNNICHAT_API_BASE}/contact/{contact_id}", headers=headers, timeout=30)
+            contact_created_at = (
+                contact_resp.json().get("data", {}).get("createdAt") if contact_resp.ok else None
+            )
+
+            resp = requests.get(
+                f"{UNNICHAT_API_BASE}/contact/{contact_id}/messages",
+                headers=headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            messages = resp.json()["data"]
+
+            for msg in messages:
+                backup_message(course, contact_id, phone_number, contact_name, contact_created_at, msg)
+
+            print(f"[{course}] {contact_id}: {len(messages)} mensagens processadas")
+        except Exception as exc:
+            print(f"[{course}] {contact_id}: ERRO ao processar — {exc}")
 
 
 def backup_message(
