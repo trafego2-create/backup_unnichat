@@ -38,6 +38,10 @@ UNNICHAT_TOKENS = {
     "inss": os.environ["UNNICHAT_TOKEN_INSS"],
     "tj": os.environ["UNNICHAT_TOKEN_TJ"],
     "bb": os.environ["UNNICHAT_TOKEN_BB"],
+    # .get() aqui (não []) pra não derrubar o serviço inteiro se essa var
+    # ainda não tiver sido criada no EasyPanel — os outros cursos continuam
+    # funcionando normalmente enquanto isso.
+    "perpetuo": os.environ.get("UNNICHAT_TOKEN_PERPETUO"),
 }
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 DASHBOARD_PASSWORD = os.environ["DASHBOARD_PASSWORD"]
@@ -64,6 +68,8 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
         raise HTTPException(status_code=401, detail="unauthorized")
     if course not in UNNICHAT_TOKENS:
         raise HTTPException(status_code=400, detail="course inválido")
+    if not UNNICHAT_TOKENS[course]:
+        raise HTTPException(status_code=500, detail=f"token não configurado pra course={course}")
 
     body = await request.json()
 
@@ -226,8 +232,8 @@ async def health():
     return {"status": "ok"}
 
 
-COURSE_LABELS = {"inss": "INSS", "tj": "TJ", "bb": "BB"}
-COURSE_PILL_CLASS = {"inss": "info", "tj": "warning", "bb": "danger"}
+COURSE_LABELS = {"inss": "INSS", "tj": "TJ", "bb": "BB", "perpetuo": "Perpétuo"}
+COURSE_PILL_CLASS = {"inss": "info", "tj": "warning", "bb": "danger", "perpetuo": "neutral"}
 
 
 def queue_count(statuses: list[str]) -> int:
