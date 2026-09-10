@@ -59,6 +59,27 @@ def supabase():
         )
     return _thread_local.client
 
+
+def with_retry(fn, *, retries: int = 3, base_delay: float = 0.5):
+    """Roda fn() com retry (backoff simples) — o cliente Supabase, sob carga
+    concorrente, ocasionalmente derruba a conexão HTTP/2 no meio do caminho
+    (ConnectionTerminated / connection reset), e uma nova tentativa quase
+    sempre resolve."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(base_delay * (attempt + 1))
+                # descarta o client dessa thread — pode estar com a conexão
+                # quebrada, força recriar do zero na próxima tentativa
+                if hasattr(_thread_local, "client"):
+                    del _thread_local.client
+    raise last_exc
+
+
 app = FastAPI()
 basic_auth = HTTPBasic()
 
@@ -97,15 +118,20 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
     # tasks em memória, isso sobrevive a um crash/restart do container.
     # Um worker separado (thread em loop, iniciado no startup) consome essa
     # fila aos poucos.
-    supabase().table("unnichat_backup_queue").insert(
-        {
-            "course": course,
-            "contact_id": contact_id,
-            "phone_number": phone_number,
-            "contact_name": contact_name,
-            "status": "pending",
-        }
-    ).execute()
+    with_retry(
+        lambda: supabase()
+        .table("unnichat_backup_queue")
+        .insert(
+            {
+                "course": course,
+                "contact_id": contact_id,
+                "phone_number": phone_number,
+                "contact_name": contact_name,
+                "status": "pending",
+            }
+        )
+        .execute()
+    )
 
     return {"success": True, "queued": True, "contactId": contact_id, "course": course}
 
@@ -114,8 +140,9 @@ def worker_loop() -> None:
     print("worker: iniciado")
     while True:
         try:
-            result = (
-                supabase().table("unnichat_backup_queue")
+            result = with_retry(
+                lambda: supabase()
+                .table("unnichat_backup_queue")
                 .select("*")
                 .eq("status", "pending")
                 .order("created_at")
@@ -130,9 +157,13 @@ def worker_loop() -> None:
             for row in rows:
                 # marca como "processing" na hora pra não pegar de novo no
                 # proximo poll enquanto ainda esta rodando
-                supabase().table("unnichat_backup_queue").update({"status": "processing"}).eq(
-                    "id", row["id"]
-                ).execute()
+                with_retry(
+                    lambda row=row: supabase()
+                    .table("unnichat_backup_queue")
+                    .update({"status": "processing"})
+                    .eq("id", row["id"])
+                    .execute()
+                )
                 WORKER_POOL.submit(process_queue_item, row)
 
             # sempre pausa um pouco entre lotes, mesmo com fila cheia — evita
@@ -170,12 +201,23 @@ def process_queue_item(row: dict) -> None:
                 course, contact_id, row.get("phone_number"), row.get("contact_name"), contact_created_at, msg
             )
 
-        supabase().table("unnichat_backup_queue").update({"status": "done"}).eq("id", row["id"]).execute()
+        with_retry(
+            lambda: supabase()
+            .table("unnichat_backup_queue")
+            .update({"status": "done"})
+            .eq("id", row["id"])
+            .execute()
+        )
         print(f"[{course}] {contact_id}: {len(messages)} mensagens processadas")
     except Exception as exc:
-        supabase().table("unnichat_backup_queue").update(
-            {"status": "error", "error_message": str(exc)[:500]}
-        ).eq("id", row["id"]).execute()
+        error_message = str(exc)[:500]
+        with_retry(
+            lambda: supabase()
+            .table("unnichat_backup_queue")
+            .update({"status": "error", "error_message": error_message})
+            .eq("id", row["id"])
+            .execute()
+        )
         print(f"[{course}] {contact_id}: ERRO ao processar — {exc}")
 
 
@@ -194,8 +236,9 @@ def backup_message(
 ) -> dict:
     message_id = msg["id"]
 
-    existing = (
-        supabase().table("unnichat_message_backups")
+    existing = with_retry(
+        lambda: supabase()
+        .table("unnichat_message_backups")
         .select("message_id")
         .eq("message_id", message_id)
         .execute()
@@ -226,14 +269,16 @@ def backup_message(
         content_type = mimetypes.guess_type(f"file.{ext}")[0] or "application/octet-stream"
         storage_path = f"{course}/{contact_id}/{message_id}.{ext}"
 
-        supabase().storage.from_(SUPABASE_BUCKET).upload(
-            storage_path, media_resp.content, {"content-type": content_type}
+        with_retry(
+            lambda: supabase()
+            .storage.from_(SUPABASE_BUCKET)
+            .upload(storage_path, media_resp.content, {"content-type": content_type})
         )
 
         row["storage_path"] = storage_path
         row["original_url"] = msg["url"]
 
-    supabase().table("unnichat_message_backups").insert(row).execute()
+    with_retry(lambda: supabase().table("unnichat_message_backups").insert(row).execute())
 
     return {"messageId": message_id, "status": "backed_up"}
 
