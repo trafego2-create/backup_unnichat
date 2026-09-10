@@ -48,3 +48,12 @@ select
     max(contact_created_at) as contact_created_at
 from unnichat_message_backups
 group by contact_id, course;
+
+-- Totais globais pro dashboard (não passa pelo limite de 1000 linhas do
+-- Supabase, porque essa view sempre retorna 1 linha só, já agregada).
+create or replace view backup_totals as
+select
+    count(distinct (contact_id, course)) as total_contatos,
+    count(*) as total_mensagens,
+    count(*) filter (where storage_path is not null) as total_midias
+from unnichat_message_backups;

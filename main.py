@@ -20,10 +20,12 @@ import threading
 import zipfile
 
 import requests
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from supabase import create_client
+
+PAGE_SIZE = 50
 
 UNNICHAT_API_BASE = "https://unnichat.com.br/api"
 SUPABASE_BUCKET = "unnichat-audios"
@@ -175,27 +177,43 @@ COURSE_PILL_CLASS = {"inss": "info", "tj": "warning", "bb": "danger"}
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(_: None = Depends(require_dashboard_auth)):
-    summary = (
-        supabase.table("contact_backup_summary")
-        .select("*")
-        .order("last_message_date", desc=True)
-        .execute()
-    ).data
+async def dashboard(
+    q: str = Query(default=""),
+    page: int = Query(default=1, ge=1),
+    _: None = Depends(require_dashboard_auth),
+):
+    totals = supabase.table("backup_totals").select("*").single().execute().data or {}
+    total_contatos = totals.get("total_contatos", 0)
+    total_mensagens = totals.get("total_mensagens", 0)
+    total_midias = totals.get("total_midias", 0)
 
-    total_contatos = len(summary)
-    total_mensagens = sum(c["message_count"] for c in summary)
-    total_midias = sum(c["media_count"] for c in summary)
+    query = supabase.table("contact_backup_summary").select("*", count="exact")
+    q = q.strip()
+    if q:
+        query = query.or_(f"phone_number.ilike.%{q}%,contact_name.ilike.%{q}%")
+
+    start = (page - 1) * PAGE_SIZE
+    result = query.order("last_message_date", desc=True).range(start, start + PAGE_SIZE - 1).execute()
+    rows = result.data
+    matched_count = result.count or 0
+    total_pages = max(1, -(-matched_count // PAGE_SIZE))  # ceil div
+
+    q_param = f"&q={html.escape(q)}" if q else ""
+    prev_link = f'<a href="/dashboard?page={page - 1}{q_param}">&larr; Anterior</a>' if page > 1 else '<a class="disabled">&larr; Anterior</a>'
+    next_link = (
+        f'<a href="/dashboard?page={page + 1}{q_param}">Próxima &rarr;</a>'
+        if page < total_pages
+        else '<a class="disabled">Próxima &rarr;</a>'
+    )
 
     rows_html = ""
-    for c in summary:
+    for c in rows:
         phone = c.get("phone_number") or "-"
         name = c.get("contact_name") or "-"
         course = c["course"]
         pill_class = COURSE_PILL_CLASS.get(course, "neutral")
-        search_blob = html.escape(f"{phone} {name}".lower())
         rows_html += f"""
-        <tr data-search="{search_blob}">
+        <tr>
             <td class="numero">{html.escape(phone)}</td>
             <td>{html.escape(name)}</td>
             <td><span class="bs-pill {pill_class}">{COURSE_LABELS.get(course, course)}</span></td>
@@ -268,6 +286,15 @@ tr:hover td {{ background:var(--accent-bg) !important; }}
 .bs-download-btn:hover {{ background:var(--accent-bg); }}
 
 .empty {{ padding:8px; color:var(--ink-muted); font-size:13px; }}
+
+.filter-form {{ display:flex; align-items:center; gap:10px; margin-bottom:16px; }}
+.filter-clear {{ font-size:12px; color:var(--ink-muted); text-decoration:none; }}
+.filter-clear:hover {{ color:var(--accent); }}
+
+.pagination {{ display:flex; align-items:center; justify-content:space-between; margin-top:14px; font-size:12px; color:var(--ink-muted); }}
+.pagination a {{ color:var(--accent); text-decoration:none; font-weight:700; padding:6px 12px; border:1px solid var(--border-s); border-radius:var(--r-md); }}
+.pagination a.disabled {{ pointer-events:none; opacity:.35; }}
+.pagination a:hover {{ background:var(--accent-bg); }}
         </style>
     </head>
     <body>
@@ -283,10 +310,13 @@ tr:hover td {{ background:var(--accent-bg) !important; }}
             </div>
 
             <div class="info-box">
-                <div class="filter-wrap">
-                    <i class="ti ti-search"></i>
-                    <input class="filter-input" id="search" type="text" placeholder="Buscar por número ou nome..." oninput="filterRows()">
-                </div>
+                <form class="filter-form" method="get" action="/dashboard">
+                    <div class="filter-wrap">
+                        <i class="ti ti-search"></i>
+                        <input class="filter-input" name="q" type="text" value="{html.escape(q)}" placeholder="Buscar por número ou nome...">
+                    </div>
+                    {f'<a class="filter-clear" href="/dashboard">limpar busca</a>' if q else ''}
+                </form>
                 <div class="table-wrap">
                     <table>
                         <thead>
@@ -297,20 +327,16 @@ tr:hover td {{ background:var(--accent-bg) !important; }}
                             </tr>
                         </thead>
                         <tbody id="rows">
-                            {rows_html or '<tr><td colspan="8" class="empty">Nenhum backup ainda.</td></tr>'}
+                            {rows_html or '<tr><td colspan="8" class="empty">Nenhum backup encontrado.</td></tr>'}
                         </tbody>
                     </table>
                 </div>
+                <div class="pagination">
+                    <span>Página {page} de {total_pages} ({matched_count} contato{'s' if matched_count != 1 else ''}{' encontrados' if q else ' no total'})</span>
+                    <div>{prev_link} {next_link}</div>
+                </div>
             </div>
         </div>
-        <script>
-        function filterRows() {{
-            const q = document.getElementById('search').value.toLowerCase().trim();
-            document.querySelectorAll('#rows tr[data-search]').forEach(function(row) {{
-                row.style.display = row.dataset.search.includes(q) ? '' : 'none';
-            }});
-        }}
-        </script>
     </body>
     </html>
     """
