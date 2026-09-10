@@ -19,6 +19,7 @@ import secrets
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -46,10 +47,10 @@ supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVIC
 app = FastAPI()
 basic_auth = HTTPBasic()
 
-# Limita quantos contatos são processados (chamadas na API da Unnichat +
-# download/upload de mídia) ao mesmo tempo, pra aguentar picos de milhares
-# de tags aplicadas de uma vez sem estourar a API da Unnichat ou o Supabase.
-PROCESSING_SEMAPHORE = threading.Semaphore(3)
+# Pool de tamanho fixo (3 threads) pra processar a fila — diferente de criar
+# uma thread nova por item (o que já causou explosão de threads e derrubou
+# o serviço uma vez), o executor enfileira o excedente sem gastar recurso.
+WORKER_POOL = ThreadPoolExecutor(max_workers=3)
 
 
 def require_dashboard_auth(credentials: HTTPBasicCredentials = Depends(basic_auth)) -> None:
@@ -115,47 +116,50 @@ def worker_loop() -> None:
                 supabase.table("unnichat_backup_queue").update({"status": "processing"}).eq(
                     "id", row["id"]
                 ).execute()
-                threading.Thread(target=process_queue_item, args=(row,), daemon=True).start()
+                WORKER_POOL.submit(process_queue_item, row)
+
+            # sempre pausa um pouco entre lotes, mesmo com fila cheia — evita
+            # bater no Supabase sem parar só pra marcar "processing"
+            time.sleep(1)
         except Exception as exc:
             print(f"worker: erro no loop — {exc}")
             time.sleep(WORKER_POLL_IDLE_SECONDS)
 
 
 def process_queue_item(row: dict) -> None:
-    with PROCESSING_SEMAPHORE:
-        course = row["course"]
-        contact_id = row["contact_id"]
-        try:
-            token = UNNICHAT_TOKENS[course]
-            headers = {"Authorization": f"Bearer {token}"}
+    # a concorrência já é limitada pelo tamanho fixo do WORKER_POOL (3
+    # threads), então essa função roda no máximo 3 vezes ao mesmo tempo.
+    course = row["course"]
+    contact_id = row["contact_id"]
+    try:
+        token = UNNICHAT_TOKENS[course]
+        headers = {"Authorization": f"Bearer {token}"}
 
-            # O payload da automação não traz "createdAt" (só vem no GET
-            # /contact/{id} completo), então buscamos separado.
-            contact_resp = requests.get(f"{UNNICHAT_API_BASE}/contact/{contact_id}", headers=headers, timeout=30)
-            contact_created_at = (
-                contact_resp.json().get("data", {}).get("createdAt") if contact_resp.ok else None
+        # O payload da automação não traz "createdAt" (só vem no GET
+        # /contact/{id} completo), então buscamos separado.
+        contact_resp = requests.get(f"{UNNICHAT_API_BASE}/contact/{contact_id}", headers=headers, timeout=30)
+        contact_created_at = contact_resp.json().get("data", {}).get("createdAt") if contact_resp.ok else None
+
+        resp = requests.get(
+            f"{UNNICHAT_API_BASE}/contact/{contact_id}/messages",
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        messages = resp.json()["data"]
+
+        for msg in messages:
+            backup_message(
+                course, contact_id, row.get("phone_number"), row.get("contact_name"), contact_created_at, msg
             )
 
-            resp = requests.get(
-                f"{UNNICHAT_API_BASE}/contact/{contact_id}/messages",
-                headers=headers,
-                timeout=30,
-            )
-            resp.raise_for_status()
-            messages = resp.json()["data"]
-
-            for msg in messages:
-                backup_message(
-                    course, contact_id, row.get("phone_number"), row.get("contact_name"), contact_created_at, msg
-                )
-
-            supabase.table("unnichat_backup_queue").update({"status": "done"}).eq("id", row["id"]).execute()
-            print(f"[{course}] {contact_id}: {len(messages)} mensagens processadas")
-        except Exception as exc:
-            supabase.table("unnichat_backup_queue").update(
-                {"status": "error", "error_message": str(exc)[:500]}
-            ).eq("id", row["id"]).execute()
-            print(f"[{course}] {contact_id}: ERRO ao processar — {exc}")
+        supabase.table("unnichat_backup_queue").update({"status": "done"}).eq("id", row["id"]).execute()
+        print(f"[{course}] {contact_id}: {len(messages)} mensagens processadas")
+    except Exception as exc:
+        supabase.table("unnichat_backup_queue").update(
+            {"status": "error", "error_message": str(exc)[:500]}
+        ).eq("id", row["id"]).execute()
+        print(f"[{course}] {contact_id}: ERRO ao processar — {exc}")
 
 
 @app.on_event("startup")
