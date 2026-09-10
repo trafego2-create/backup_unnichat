@@ -17,15 +17,18 @@ import mimetypes
 import os
 import secrets
 import threading
+import time
 import zipfile
 
 import requests
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from supabase import create_client
 
 PAGE_SIZE = 50
+WORKER_BATCH_SIZE = 3
+WORKER_POLL_IDLE_SECONDS = 5
 
 UNNICHAT_API_BASE = "https://unnichat.com.br/api"
 SUPABASE_BUCKET = "unnichat-audios"
@@ -55,12 +58,7 @@ def require_dashboard_auth(credentials: HTTPBasicCredentials = Depends(basic_aut
 
 
 @app.post("/webhook/{course}")
-async def webhook(
-    course: str,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_webhook_secret: str = Header(None),
-):
+async def webhook(course: str, request: Request, x_webhook_secret: str = Header(None)):
     if x_webhook_secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
     if course not in UNNICHAT_TOKENS:
@@ -77,15 +75,56 @@ async def webhook(
     phone_number = contact_obj.get("phoneNumber")
     contact_name = contact_obj.get("name")
 
-    # Responde na hora e processa em segundo plano: com picos de milhares de
-    # tags aplicadas de uma vez, a Unnichat marca como falha se demorarmos
-    # pra responder, mesmo que o backup em si funcione.
-    background_tasks.add_task(process_contact, course, contact_id, phone_number, contact_name)
+    # Grava na fila (tabela) ANTES de responder — diferente de background
+    # tasks em memória, isso sobrevive a um crash/restart do container.
+    # Um worker separado (thread em loop, iniciado no startup) consome essa
+    # fila aos poucos.
+    supabase.table("unnichat_backup_queue").insert(
+        {
+            "course": course,
+            "contact_id": contact_id,
+            "phone_number": phone_number,
+            "contact_name": contact_name,
+            "status": "pending",
+        }
+    ).execute()
+
     return {"success": True, "queued": True, "contactId": contact_id, "course": course}
 
 
-def process_contact(course: str, contact_id: str, phone_number: str, contact_name: str) -> None:
+def worker_loop() -> None:
+    print("worker: iniciado")
+    while True:
+        try:
+            result = (
+                supabase.table("unnichat_backup_queue")
+                .select("*")
+                .eq("status", "pending")
+                .order("created_at")
+                .limit(WORKER_BATCH_SIZE)
+                .execute()
+            )
+            rows = result.data
+            if not rows:
+                time.sleep(WORKER_POLL_IDLE_SECONDS)
+                continue
+
+            for row in rows:
+                # marca como "processing" na hora pra não pegar de novo no
+                # proximo poll enquanto ainda esta rodando
+                supabase.table("unnichat_backup_queue").update({"status": "processing"}).eq(
+                    "id", row["id"]
+                ).execute()
+                threading.Thread(target=process_queue_item, args=(row,), daemon=True).start()
+        except Exception as exc:
+            print(f"worker: erro no loop — {exc}")
+            time.sleep(WORKER_POLL_IDLE_SECONDS)
+
+
+def process_queue_item(row: dict) -> None:
     with PROCESSING_SEMAPHORE:
+        course = row["course"]
+        contact_id = row["contact_id"]
         try:
             token = UNNICHAT_TOKENS[course]
             headers = {"Authorization": f"Bearer {token}"}
@@ -106,11 +145,22 @@ def process_contact(course: str, contact_id: str, phone_number: str, contact_nam
             messages = resp.json()["data"]
 
             for msg in messages:
-                backup_message(course, contact_id, phone_number, contact_name, contact_created_at, msg)
+                backup_message(
+                    course, contact_id, row.get("phone_number"), row.get("contact_name"), contact_created_at, msg
+                )
 
+            supabase.table("unnichat_backup_queue").update({"status": "done"}).eq("id", row["id"]).execute()
             print(f"[{course}] {contact_id}: {len(messages)} mensagens processadas")
         except Exception as exc:
+            supabase.table("unnichat_backup_queue").update(
+                {"status": "error", "error_message": str(exc)[:500]}
+            ).eq("id", row["id"]).execute()
             print(f"[{course}] {contact_id}: ERRO ao processar — {exc}")
+
+
+@app.on_event("startup")
+def start_worker() -> None:
+    threading.Thread(target=worker_loop, daemon=True).start()
 
 
 def backup_message(
@@ -176,6 +226,17 @@ COURSE_LABELS = {"inss": "INSS", "tj": "TJ", "bb": "BB"}
 COURSE_PILL_CLASS = {"inss": "info", "tj": "warning", "bb": "danger"}
 
 
+def queue_count(statuses: list[str]) -> int:
+    result = (
+        supabase.table("unnichat_backup_queue")
+        .select("id", count="exact")
+        .in_("status", statuses)
+        .limit(1)
+        .execute()
+    )
+    return result.count or 0
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(
     q: str = Query(default=""),
@@ -186,6 +247,9 @@ async def dashboard(
     total_contatos = totals.get("total_contatos", 0)
     total_mensagens = totals.get("total_mensagens", 0)
     total_midias = totals.get("total_midias", 0)
+
+    pending_count = queue_count(["pending", "processing"])
+    error_count = queue_count(["error"])
 
     query = supabase.table("contact_backup_summary").select("*", count="exact")
     q = q.strip()
@@ -307,6 +371,8 @@ tr:hover td {{ background:var(--accent-bg) !important; }}
                 <div class="kpi"><div class="kpi-label">Contatos arquivados</div><div class="kpi-value">{total_contatos}</div></div>
                 <div class="kpi"><div class="kpi-label">Mensagens</div><div class="kpi-value">{total_mensagens}</div></div>
                 <div class="kpi"><div class="kpi-label">Mídias (áudio/vídeo/imagem)</div><div class="kpi-value">{total_midias}</div></div>
+                <div class="kpi"><div class="kpi-label">Na fila</div><div class="kpi-value">{pending_count}</div></div>
+                <div class="kpi"><div class="kpi-label">Com erro</div><div class="kpi-value">{error_count}</div></div>
             </div>
 
             <div class="info-box">

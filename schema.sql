@@ -57,3 +57,20 @@ select
     count(*) as total_mensagens,
     count(*) filter (where storage_path is not null) as total_midias
 from unnichat_message_backups;
+
+-- Fila persistida: o webhook so grava aqui e responde na hora; um worker
+-- em background (thread no proprio serviço) consome aos poucos. Diferente
+-- de background tasks em memoria, sobrevive a reinicio/crash do container.
+create table if not exists unnichat_backup_queue (
+    id bigint generated always as identity primary key,
+    course text not null,
+    contact_id text not null,
+    phone_number text,
+    contact_name text,
+    status text not null default 'pending',  -- pending | processing | done | error
+    error_message text,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_unnichat_backup_queue_status
+    on unnichat_backup_queue (status, created_at);
