@@ -46,7 +46,18 @@ UNNICHAT_TOKENS = {
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 DASHBOARD_PASSWORD = os.environ["DASHBOARD_PASSWORD"]
 
-supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+# Cliente do Supabase por thread — evita erros de conexão (ConnectionTerminated,
+# "dictionary changed size during iteration") que aconteciam ao compartilhar
+# um único client entre o worker pool (3 threads) e o request handler.
+_thread_local = threading.local()
+
+
+def supabase():
+    if not hasattr(_thread_local, "client"):
+        _thread_local.client = create_client(
+            os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+        )
+    return _thread_local.client
 
 app = FastAPI()
 basic_auth = HTTPBasic()
@@ -86,7 +97,7 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
     # tasks em memória, isso sobrevive a um crash/restart do container.
     # Um worker separado (thread em loop, iniciado no startup) consome essa
     # fila aos poucos.
-    supabase.table("unnichat_backup_queue").insert(
+    supabase().table("unnichat_backup_queue").insert(
         {
             "course": course,
             "contact_id": contact_id,
@@ -104,7 +115,7 @@ def worker_loop() -> None:
     while True:
         try:
             result = (
-                supabase.table("unnichat_backup_queue")
+                supabase().table("unnichat_backup_queue")
                 .select("*")
                 .eq("status", "pending")
                 .order("created_at")
@@ -119,7 +130,7 @@ def worker_loop() -> None:
             for row in rows:
                 # marca como "processing" na hora pra não pegar de novo no
                 # proximo poll enquanto ainda esta rodando
-                supabase.table("unnichat_backup_queue").update({"status": "processing"}).eq(
+                supabase().table("unnichat_backup_queue").update({"status": "processing"}).eq(
                     "id", row["id"]
                 ).execute()
                 WORKER_POOL.submit(process_queue_item, row)
@@ -159,10 +170,10 @@ def process_queue_item(row: dict) -> None:
                 course, contact_id, row.get("phone_number"), row.get("contact_name"), contact_created_at, msg
             )
 
-        supabase.table("unnichat_backup_queue").update({"status": "done"}).eq("id", row["id"]).execute()
+        supabase().table("unnichat_backup_queue").update({"status": "done"}).eq("id", row["id"]).execute()
         print(f"[{course}] {contact_id}: {len(messages)} mensagens processadas")
     except Exception as exc:
-        supabase.table("unnichat_backup_queue").update(
+        supabase().table("unnichat_backup_queue").update(
             {"status": "error", "error_message": str(exc)[:500]}
         ).eq("id", row["id"]).execute()
         print(f"[{course}] {contact_id}: ERRO ao processar — {exc}")
@@ -184,7 +195,7 @@ def backup_message(
     message_id = msg["id"]
 
     existing = (
-        supabase.table("unnichat_message_backups")
+        supabase().table("unnichat_message_backups")
         .select("message_id")
         .eq("message_id", message_id)
         .execute()
@@ -215,14 +226,14 @@ def backup_message(
         content_type = mimetypes.guess_type(f"file.{ext}")[0] or "application/octet-stream"
         storage_path = f"{course}/{contact_id}/{message_id}.{ext}"
 
-        supabase.storage.from_(SUPABASE_BUCKET).upload(
+        supabase().storage.from_(SUPABASE_BUCKET).upload(
             storage_path, media_resp.content, {"content-type": content_type}
         )
 
         row["storage_path"] = storage_path
         row["original_url"] = msg["url"]
 
-    supabase.table("unnichat_message_backups").insert(row).execute()
+    supabase().table("unnichat_message_backups").insert(row).execute()
 
     return {"messageId": message_id, "status": "backed_up"}
 
@@ -238,7 +249,7 @@ COURSE_PILL_CLASS = {"inss": "info", "tj": "warning", "bb": "danger", "perpetuo"
 
 def queue_count(statuses: list[str]) -> int:
     result = (
-        supabase.table("unnichat_backup_queue")
+        supabase().table("unnichat_backup_queue")
         .select("id", count="exact")
         .in_("status", statuses)
         .limit(1)
@@ -253,7 +264,7 @@ async def dashboard(
     page: int = Query(default=1, ge=1),
     _: None = Depends(require_dashboard_auth),
 ):
-    totals = supabase.table("backup_totals").select("*").single().execute().data or {}
+    totals = supabase().table("backup_totals").select("*").single().execute().data or {}
     total_contatos = totals.get("total_contatos", 0)
     total_mensagens = totals.get("total_mensagens", 0)
     total_midias = totals.get("total_midias", 0)
@@ -261,7 +272,7 @@ async def dashboard(
     pending_count = queue_count(["pending", "processing"])
     error_count = queue_count(["error"])
 
-    query = supabase.table("contact_backup_summary").select("*", count="exact")
+    query = supabase().table("contact_backup_summary").select("*", count="exact")
     q = q.strip()
     if q:
         query = query.or_(f"phone_number.ilike.%{q}%,contact_name.ilike.%{q}%")
@@ -421,7 +432,7 @@ tr:hover td {{ background:var(--accent-bg) !important; }}
 @app.get("/dashboard/download/{course}/{contact_id}")
 async def download_contact(course: str, contact_id: str, _: None = Depends(require_dashboard_auth)):
     messages = (
-        supabase.table("unnichat_message_backups")
+        supabase().table("unnichat_message_backups")
         .select("*")
         .eq("course", course)
         .eq("contact_id", contact_id)
@@ -444,7 +455,7 @@ async def download_contact(course: str, contact_id: str, _: None = Depends(requi
             transcript_lines.append(line)
 
             if m.get("storage_path"):
-                file_bytes = supabase.storage.from_(SUPABASE_BUCKET).download(m["storage_path"])
+                file_bytes = supabase().storage.from_(SUPABASE_BUCKET).download(m["storage_path"])
                 zf.writestr(m["storage_path"].split("/")[-1], file_bytes)
 
         zf.writestr("conversa.txt", "\n".join(transcript_lines))
