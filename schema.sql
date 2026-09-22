@@ -74,3 +74,8 @@ create table if not exists unnichat_backup_queue (
 
 create index if not exists idx_unnichat_backup_queue_status
     on unnichat_backup_queue (status, created_at);
+
+-- Retry automatico: em vez de marcar "error" na primeira falha, tenta de
+-- novo algumas vezes antes de desistir de verdade.
+alter table unnichat_backup_queue
+    add column if not exists retry_count int not null default 0;

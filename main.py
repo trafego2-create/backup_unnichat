@@ -31,6 +31,7 @@ from supabase import create_client
 PAGE_SIZE = 50
 WORKER_BATCH_SIZE = 3
 WORKER_POLL_IDLE_SECONDS = 5
+MAX_RETRIES = 3
 
 UNNICHAT_API_BASE = "https://unnichat.com.br/api"
 SUPABASE_BUCKET = "unnichat-audios"
@@ -252,14 +253,23 @@ def process_queue_item(row: dict) -> None:
         print(f"[{course}] {contact_id}: {len(messages)} mensagens processadas")
     except Exception as exc:
         error_message = str(exc)[:500]
+        retry_count = row.get("retry_count", 0) + 1
+        # tenta mais algumas vezes antes de desistir de vez — cobre erro
+        # transitório (rede, API fora do ar por um instante). Erro
+        # permanente (ex: "contact not found in this connection") também
+        # vai tentar de novo, mas falha do mesmo jeito nas 3x e para aí.
+        next_status = "pending" if retry_count < MAX_RETRIES else "error"
         with_retry(
             lambda: supabase()
             .table("unnichat_backup_queue")
-            .update({"status": "error", "error_message": error_message})
+            .update({"status": next_status, "error_message": error_message, "retry_count": retry_count})
             .eq("id", row["id"])
             .execute()
         )
-        print(f"[{course}] {contact_id}: ERRO ao processar — {exc}")
+        if next_status == "error":
+            print(f"[{course}] {contact_id}: ERRO definitivo após {retry_count} tentativas — {exc}")
+        else:
+            print(f"[{course}] {contact_id}: falhou (tentativa {retry_count}/{MAX_RETRIES}), voltando pra fila — {exc}")
 
 
 @app.on_event("startup")
