@@ -25,6 +25,7 @@ import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.concurrency import run_in_threadpool
 from supabase import create_client
 
 PAGE_SIZE = 50
@@ -118,7 +119,15 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
     # tasks em memória, isso sobrevive a um crash/restart do container.
     # Um worker separado (thread em loop, iniciado no startup) consome essa
     # fila aos poucos.
-    with_retry(
+    #
+    # run_in_threadpool: a chamada ao Supabase é síncrona (bloqueante). Sem
+    # isso, ela trava o event loop inteiro enquanto espera resposta —
+    # significa que o servidor só consegue atender UMA requisição por vez
+    # nesse trecho. Num pico de milhares em poucos minutos (como aconteceu
+    # com o TJ), isso enche a fila de conexão e a Unnichat toma timeout
+    # antes da gente sequer conseguir gravar.
+    await run_in_threadpool(
+        with_retry,
         lambda: supabase()
         .table("unnichat_backup_queue")
         .insert(
@@ -130,7 +139,7 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
                 "status": "pending",
             }
         )
-        .execute()
+        .execute(),
     )
 
     return {"success": True, "queued": True, "contactId": contact_id, "course": course}
@@ -293,8 +302,9 @@ COURSE_PILL_CLASS = {"inss": "info", "tj": "warning", "bb": "danger", "perpetuo"
 
 
 def queue_count(statuses: list[str]) -> int:
-    result = (
-        supabase().table("unnichat_backup_queue")
+    result = with_retry(
+        lambda: supabase()
+        .table("unnichat_backup_queue")
         .select("id", count="exact")
         .in_("status", statuses)
         .limit(1)
@@ -303,30 +313,51 @@ def queue_count(statuses: list[str]) -> int:
     return result.count or 0
 
 
+def _load_dashboard_data(q: str, page: int) -> dict:
+    """Todas as chamadas bloqueantes ao Supabase pro /dashboard, pra rodar
+    em thread separada (run_in_threadpool) e não travar o event loop."""
+    totals = with_retry(lambda: supabase().table("backup_totals").select("*").single().execute()).data or {}
+
+    pending_count = queue_count(["pending", "processing"])
+    error_count = queue_count(["error"])
+
+    query = supabase().table("contact_backup_summary").select("*", count="exact")
+    if q:
+        query = query.or_(f"phone_number.ilike.%{q}%,contact_name.ilike.%{q}%")
+
+    start = (page - 1) * PAGE_SIZE
+    result = with_retry(lambda: query.order("last_message_date", desc=True).range(start, start + PAGE_SIZE - 1).execute())
+    matched_count = result.count or 0
+    total_pages = max(1, -(-matched_count // PAGE_SIZE))  # ceil div
+
+    return {
+        "total_contatos": totals.get("total_contatos", 0),
+        "total_mensagens": totals.get("total_mensagens", 0),
+        "total_midias": totals.get("total_midias", 0),
+        "pending_count": pending_count,
+        "error_count": error_count,
+        "rows": result.data,
+        "matched_count": matched_count,
+        "total_pages": total_pages,
+    }
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(
     q: str = Query(default=""),
     page: int = Query(default=1, ge=1),
     _: None = Depends(require_dashboard_auth),
 ):
-    totals = supabase().table("backup_totals").select("*").single().execute().data or {}
-    total_contatos = totals.get("total_contatos", 0)
-    total_mensagens = totals.get("total_mensagens", 0)
-    total_midias = totals.get("total_midias", 0)
-
-    pending_count = queue_count(["pending", "processing"])
-    error_count = queue_count(["error"])
-
-    query = supabase().table("contact_backup_summary").select("*", count="exact")
     q = q.strip()
-    if q:
-        query = query.or_(f"phone_number.ilike.%{q}%,contact_name.ilike.%{q}%")
-
-    start = (page - 1) * PAGE_SIZE
-    result = query.order("last_message_date", desc=True).range(start, start + PAGE_SIZE - 1).execute()
-    rows = result.data
-    matched_count = result.count or 0
-    total_pages = max(1, -(-matched_count // PAGE_SIZE))  # ceil div
+    data = await run_in_threadpool(_load_dashboard_data, q, page)
+    total_contatos = data["total_contatos"]
+    total_mensagens = data["total_mensagens"]
+    total_midias = data["total_midias"]
+    pending_count = data["pending_count"]
+    error_count = data["error_count"]
+    rows = data["rows"]
+    matched_count = data["matched_count"]
+    total_pages = data["total_pages"]
 
     q_param = f"&q={html.escape(q)}" if q else ""
     prev_link = f'<a href="/dashboard?page={page - 1}{q_param}">&larr; Anterior</a>' if page > 1 else '<a class="disabled">&larr; Anterior</a>'
@@ -474,10 +505,10 @@ tr:hover td {{ background:var(--accent-bg) !important; }}
     """
 
 
-@app.get("/dashboard/download/{course}/{contact_id}")
-async def download_contact(course: str, contact_id: str, _: None = Depends(require_dashboard_auth)):
-    messages = (
-        supabase().table("unnichat_message_backups")
+def _build_contact_zip(course: str, contact_id: str) -> tuple[io.BytesIO, str]:
+    messages = with_retry(
+        lambda: supabase()
+        .table("unnichat_message_backups")
         .select("*")
         .eq("course", course)
         .eq("contact_id", contact_id)
@@ -500,13 +531,18 @@ async def download_contact(course: str, contact_id: str, _: None = Depends(requi
             transcript_lines.append(line)
 
             if m.get("storage_path"):
-                file_bytes = supabase().storage.from_(SUPABASE_BUCKET).download(m["storage_path"])
+                file_bytes = with_retry(lambda m=m: supabase().storage.from_(SUPABASE_BUCKET).download(m["storage_path"]))
                 zf.writestr(m["storage_path"].split("/")[-1], file_bytes)
 
         zf.writestr("conversa.txt", "\n".join(transcript_lines))
 
     zip_buffer.seek(0)
-    filename = f"{course}_{phone}.zip"
+    return zip_buffer, f"{course}_{phone}.zip"
+
+
+@app.get("/dashboard/download/{course}/{contact_id}")
+async def download_contact(course: str, contact_id: str, _: None = Depends(require_dashboard_auth)):
+    zip_buffer, filename = await run_in_threadpool(_build_contact_zip, course, contact_id)
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
