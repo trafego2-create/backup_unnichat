@@ -145,10 +145,42 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
     return {"success": True, "queued": True, "contactId": contact_id, "course": course}
 
 
+    # 30min: num pico grande (milhares de itens, só 3 workers), um item pode
+    # legitimamente ficar esperando na fila interna do executor por bastante
+    # tempo sem estar travado de verdade — esse limiar precisa ser folgado
+    # o suficiente pra não reenfileirar (e processar 2x) algo que só está
+    # devagar, só pegar o que realmente ficou órfão (worker morreu no meio).
+STALE_PROCESSING_MINUTES = 30
+STALE_CHECK_INTERVAL_SECONDS = 60
+
+
+def requeue_stale_processing() -> None:
+    """Itens presos em "processing" há muito tempo (o worker provavelmente
+    morreu no meio — restart do container, deploy, etc) voltam sozinhos pra
+    "pending". Sem isso, um crash no meio do processamento perde o item pra
+    sempre (nada mais pega de volta um "processing" travado)."""
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - STALE_PROCESSING_MINUTES * 60))
+    result = with_retry(
+        lambda: supabase()
+        .table("unnichat_backup_queue")
+        .update({"status": "pending"})
+        .eq("status", "processing")
+        .lt("created_at", cutoff)
+        .execute()
+    )
+    if result.data:
+        print(f"worker: recuperou {len(result.data)} item(ns) presos em 'processing'")
+
+
 def worker_loop() -> None:
     print("worker: iniciado")
+    last_stale_check = 0.0
     while True:
         try:
+            if time.monotonic() - last_stale_check > STALE_CHECK_INTERVAL_SECONDS:
+                requeue_stale_processing()
+                last_stale_check = time.monotonic()
+
             result = with_retry(
                 lambda: supabase()
                 .table("unnichat_backup_queue")
