@@ -47,6 +47,9 @@ UNNICHAT_TOKENS = {
 }
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 DASHBOARD_PASSWORD = os.environ["DASHBOARD_PASSWORD"]
+# Opcional: URL de webhook Discord/Slack. Se não configurar, o serviço
+# funciona normalmente, só que sem alerta (fica só visível no /dashboard).
+ERROR_WEBHOOK_URL = os.environ.get("ERROR_WEBHOOK_URL")
 
 # Cliente do Supabase por thread — evita erros de conexão (ConnectionTerminated,
 # "dictionary changed size during iteration") que aconteciam ao compartilhar
@@ -82,6 +85,22 @@ def with_retry(fn, *, retries: int = 3, base_delay: float = 0.5):
     raise last_exc
 
 
+def notify_error(course: str, contact_id: str, error_message: str) -> None:
+    """Dispara um alerta (Discord/Slack) quando um item esgota as tentativas
+    e vira erro definitivo. Sem ERROR_WEBHOOK_URL configurado, não faz nada —
+    o erro continua visível só no /dashboard."""
+    if not ERROR_WEBHOOK_URL:
+        return
+    try:
+        requests.post(
+            ERROR_WEBHOOK_URL,
+            json={"content": f"⚠️ Backup Unnichat: falha definitiva em `{course}/{contact_id}` — {error_message[:300]}"},
+            timeout=10,
+        )
+    except Exception as exc:
+        print(f"notify_error: falha ao enviar alerta — {exc}")
+
+
 app = FastAPI()
 basic_auth = HTTPBasic()
 
@@ -96,22 +115,58 @@ def require_dashboard_auth(credentials: HTTPBasicCredentials = Depends(basic_aut
         raise HTTPException(status_code=401, detail="unauthorized", headers={"WWW-Authenticate": "Basic"})
 
 
+def log_rejected_webhook(course: str, body, reason: str) -> None:
+    """Registra uma rejeição de webhook (payload invalido, course errado,
+    contactId ausente, etc) como erro definitivo na fila — antes disso essas
+    falhas só apareciam nos logs crus do EasyPanel, invisíveis no dashboard."""
+    try:
+        contact_id = "unknown"
+        if isinstance(body, dict):
+            contact_obj = body.get("contact") or body.get("data") or body
+            if isinstance(contact_obj, dict):
+                contact_id = contact_obj.get("id") or body.get("contactId") or "unknown"
+        with_retry(
+            lambda: supabase()
+            .table("unnichat_backup_queue")
+            .insert(
+                {
+                    "course": course,
+                    "contact_id": contact_id,
+                    "status": "error",
+                    "error_message": f"rejeitado no webhook: {reason}"[:500],
+                    "retry_count": MAX_RETRIES,
+                }
+            )
+            .execute()
+        )
+    except Exception as exc:
+        print(f"log_rejected_webhook: falha ao registrar rejeição — {exc}")
+
+
 @app.post("/webhook/{course}")
 async def webhook(course: str, request: Request, x_webhook_secret: str = Header(None)):
     if x_webhook_secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        await run_in_threadpool(log_rejected_webhook, course, None, f"payload não é JSON válido: {exc}")
+        raise HTTPException(status_code=400, detail="payload inválido")
+
     if course not in UNNICHAT_TOKENS:
+        await run_in_threadpool(log_rejected_webhook, course, body, "course inválido")
         raise HTTPException(status_code=400, detail="course inválido")
     if not UNNICHAT_TOKENS[course]:
+        await run_in_threadpool(log_rejected_webhook, course, body, f"token não configurado pra course={course}")
         raise HTTPException(status_code=500, detail=f"token não configurado pra course={course}")
-
-    body = await request.json()
 
     # A Unnichat manda o contato solto no corpo, ou aninhado em "contact"/"data"
     # dependendo do gatilho da automação.
     contact_obj = body.get("contact") or body.get("data") or body
     contact_id = contact_obj.get("id") or body.get("contactId")
     if not contact_id:
+        await run_in_threadpool(log_rejected_webhook, course, body, "contactId ausente no body")
         raise HTTPException(status_code=400, detail="contactId ausente no body")
     phone_number = contact_obj.get("phoneNumber")
     contact_name = contact_obj.get("name")
@@ -238,9 +293,21 @@ def process_queue_item(row: dict) -> None:
         resp.raise_for_status()
         messages = resp.json()["data"]
 
+        # Cada mensagem é isolada — uma falhar não pode impedir as outras de
+        # serem tentadas (senão o loop para na primeira e as mensagens
+        # seguintes desse contato nunca chegam a ser processadas).
+        failed = []
         for msg in messages:
-            backup_message(
-                course, contact_id, row.get("phone_number"), row.get("contact_name"), contact_created_at, msg
+            try:
+                backup_message(
+                    course, contact_id, row.get("phone_number"), row.get("contact_name"), contact_created_at, msg
+                )
+            except Exception as msg_exc:
+                failed.append((msg.get("id"), str(msg_exc)))
+
+        if failed:
+            raise Exception(
+                f"{len(failed)}/{len(messages)} mensagens falharam — ex: {failed[0][0]}: {failed[0][1][:200]}"
             )
 
         with_retry(
@@ -268,6 +335,7 @@ def process_queue_item(row: dict) -> None:
         )
         if next_status == "error":
             print(f"[{course}] {contact_id}: ERRO definitivo após {retry_count} tentativas — {exc}")
+            notify_error(course, contact_id, error_message)
         else:
             print(f"[{course}] {contact_id}: falhou (tentativa {retry_count}/{MAX_RETRIES}), voltando pra fila — {exc}")
 
@@ -320,10 +388,14 @@ def backup_message(
         content_type = mimetypes.guess_type(f"file.{ext}")[0] or "application/octet-stream"
         storage_path = f"{course}/{contact_id}/{message_id}.{ext}"
 
+        # upsert=true: numa tentativa anterior (que falhou depois do upload,
+        # antes do insert na tabela) o arquivo já pode existir no Storage —
+        # sem upsert, a 2a tentativa falharia com "já existe" pra sempre,
+        # travando essa mensagem em erro permanente mesmo sendo recuperável.
         with_retry(
             lambda: supabase()
             .storage.from_(SUPABASE_BUCKET)
-            .upload(storage_path, media_resp.content, {"content-type": content_type})
+            .upload(storage_path, media_resp.content, {"content-type": content_type, "upsert": "true"})
         )
 
         row["storage_path"] = storage_path
