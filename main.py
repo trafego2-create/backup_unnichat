@@ -201,11 +201,11 @@ async def webhook(course: str, request: Request, x_webhook_secret: str = Header(
     return {"success": True, "queued": True, "contactId": contact_id, "course": course}
 
 
-    # 30min: num pico grande (milhares de itens, só 3 workers), um item pode
-    # legitimamente ficar esperando na fila interna do executor por bastante
-    # tempo sem estar travado de verdade — esse limiar precisa ser folgado
-    # o suficiente pra não reenfileirar (e processar 2x) algo que só está
-    # devagar, só pegar o que realmente ficou órfão (worker morreu no meio).
+# 30min: num pico grande (milhares de itens, só 3 workers), um item pode
+# legitimamente ficar esperando na fila interna do executor por bastante
+# tempo sem estar travado de verdade — esse limiar precisa ser folgado
+# o suficiente pra não reenfileirar (e processar 2x) algo que só está
+# devagar, só pegar o que realmente ficou órfão (worker morreu no meio).
 STALE_PROCESSING_MINUTES = 30
 STALE_CHECK_INTERVAL_SECONDS = 60
 
@@ -228,10 +228,15 @@ def requeue_stale_processing() -> None:
         print(f"worker: recuperou {len(result.data)} item(ns) presos em 'processing'")
 
 
+_worker_last_heartbeat = time.monotonic()
+
+
 def worker_loop() -> None:
+    global _worker_last_heartbeat
     print("worker: iniciado")
     last_stale_check = 0.0
     while True:
+        _worker_last_heartbeat = time.monotonic()
         try:
             if time.monotonic() - last_stale_check > STALE_CHECK_INTERVAL_SECONDS:
                 requeue_stale_processing()
@@ -340,9 +345,29 @@ def process_queue_item(row: dict) -> None:
             print(f"[{course}] {contact_id}: falhou (tentativa {retry_count}/{MAX_RETRIES}), voltando pra fila — {exc}")
 
 
+# Se o worker ficar sem dar sinal de vida por mais que isso, o watchdog
+# assume que ele morreu/travou (pode acontecer sem gerar nenhum erro — ele
+# simplesmente para de rodar, de um jeito que já vimos acontecer em
+# produção) e religa sozinho, avisando via ERROR_WEBHOOK_URL se configurado.
+WATCHDOG_CHECK_INTERVAL_SECONDS = 60
+WATCHDOG_STALE_THRESHOLD_SECONDS = 180
+
+
+def watchdog_loop() -> None:
+    while True:
+        time.sleep(WATCHDOG_CHECK_INTERVAL_SECONDS)
+        idle_for = time.monotonic() - _worker_last_heartbeat
+        if idle_for > WATCHDOG_STALE_THRESHOLD_SECONDS:
+            msg = f"worker sem sinal de vida há {idle_for:.0f}s — reiniciado automaticamente pelo watchdog"
+            print(f"watchdog: {msg}")
+            notify_error("sistema", "worker", msg)
+            threading.Thread(target=worker_loop, daemon=True).start()
+
+
 @app.on_event("startup")
 def start_worker() -> None:
     threading.Thread(target=worker_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
 
 def backup_message(
